@@ -1,0 +1,282 @@
+---
+title: "NLP - Twitter Sentiment Analysis"
+author: "Jaime Fomperosa"
+date: "25/01/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries for text analysis
+pacman automatically installs all the missing libraries instead of returning an error when loading them.
+```{r}
+if (!require("pacman")) install.packages("pacman")
+# pacman automatically installs missing libraries before loading
+pacman::p_load(
+  rtweet, # load twitter library
+  ggplot2, # plotting
+  dplyr, # pipes
+  tidytext, # text mining library
+  tm,
+  wordcloud2,
+  stringr,
+  xts,
+  textdata
+)
+```
+
+We set the variables with the credentials to use the Twitter API (substitute these fields with yours)
+
+```{r}
+appname <- "SentimentAnalysisR_JF"
+key <- "XXXXXXXXXXXXXXXXXXXXXXXX"
+secret <- "XXXXXXXXXXXXXXXXXXXXXXXX"
+access_token <- "XXXXXXXXXXXXXXXXXXXXXXXX"
+access_secret <- "XXXXXXXXXXXXXXXXXXXXXXXX"
+```
+
+It is necessary to create a token before making request through the API, the first time uncomment the create_token call
+```{r}
+# create token named "twitter_token"
+#twitter_token <- create_token(
+#  app = appname,
+#  consumer_key = key,
+#  consumer_secret = secret,
+#  access_token = access_token,
+#  access_secret = access_secret)
+
+# In following sessions just use this, it gets stored as a system variable
+get_token()
+```
+Some constants to define the analysis
+To make the same analysis on a different topic, changing the variables here should be enough
+```{r}
+HASHTAG <- "#bitcoin"
+N <- 2000
+LANG <- "en"
+VERIFIED_ONLY <- TRUE
+COLS_TO_DEL <- "quoted|retweet|coords|location|place|media|url|lang|reply|count|mentions|display|description|protected|source|quote"
+
+QUERY <- if(!VERIFIED_ONLY) HASHTAG else paste(HASHTAG, "filter:verified", sep = " ")
+```
+
+The N most recent tweets with the selected query are retrieved
+```{r}
+tweets <- search_tweets(q = QUERY,
+                        n = N,
+                        include_rts = FALSE,
+                        parse = TRUE,
+                        lang = LANG,
+                        retryonratelimit = TRUE
+                        )
+```
+
+Unnecessary columns are removed
+```{r}
+del_cols <- function(tw) {
+  filters <- COLS_TO_DEL
+  cols.del <- colnames(tw) %>% 
+    str_subset(filters, negate = TRUE)
+  return(select(tw, cols.del))
+}
+tweets <- del_cols(tweets)
+```
+
+Some tweets are shown to get an idea of what we are working with
+```{r}
+head(tweets$text, n = 10)
+```
+
+## Checking the encoding
+
+Install or load the necessary library
+```{r}
+p_load(utf8)
+```
+
+Check if there are any invalid characters in the tweets
+```{r}
+tweets$text[!utf8_valid(tweets$text)]
+```
+Normalize tweets and count differences
+```{r}
+tweets.norm <- utf8_normalize(tweets$text)
+sum(tweets.norm != tweets$text)
+```
+All tweets already had a normalized encoding
+
+### Some exploration
+
+We check how long the tweets are
+```{r}
+hist_tweets_len <- function(texts) {
+  hist(nchar(texts),
+     main = "Histogram of tweets length",
+     xlab = "Number of characters")
+}
+```
+
+Use the previous function for the actual plotting
+```{r}
+hist_tweets_len(tweets$text)
+```
+## Data cleaning
+
+Function for cleaning the text by removing links, usernames, line breaks, punctuation signs, etc.
+```{r}
+clean_text <- function(text) {
+  ct <- gsub(HASHTAG, "", text)
+  ct <- gsub("http\\S*", "", text)
+  ct <- gsub("@\\S*", "", ct) 
+  ct <- gsub("&amp;", " ", ct) 
+  ct <- gsub("[\r\n]{1,}", " ", ct)
+  ct <- gsub("[[:punct:]]", "", ct)
+  ct <- gsub("[[:digit:]]", "", ct)
+  ct <- gsub(" {2,}", " ", ct)
+  return(ct)
+}
+```
+
+
+### Tweets before cleaning the text
+```{r}
+head(tweets$text, n = 10)
+```
+
+## Actual cleaning and tweets after cleaning the text
+```{r}
+tweets$text <- clean_text(tweets$text)
+head(tweets$text, n = 10)
+```
+
+Now the number of characters is consistent with the max length of a tweet (280)
+```{r}
+max(nchar(tweets$text))
+```
+
+## Number of chars per tweet after cleaning
+```{r}
+hist_tweets_len(tweets$text)
+```
+For ease in temporal analysis later, all date times are rounded to the hour
+```{r}
+tweets$created_hour <- tweets$created_at %>% round(units = "hours") 
+```
+
+We separate the tweets into individual words to count their frequency
+```{r}
+tweets.unnested <- unnest_tokens(tweets, words, text)
+head(tweets.unnested$words, n = 20)
+```
+Before counting, stop words should be removed
+```{r}
+sw <- data.frame(words = stopwords(LANG))
+tweets.unnested <- anti_join(tweets.unnested, sw)
+```
+A word cloud to illustrate most relevant words for this hashtag
+```{r}
+wordcloud2(tweets.unnested %>% count(words))
+```
+Of course, Bitcoin is the most frequent one even after removing its appearance with the hashtag. 
+
+
+
+These are the words that are being used in relationship with the searched topic the most
+```{r}
+ggplot(
+  tweets.unnested %>% count(words) %>% arrange(desc(n)) %>% head(15),
+  aes(x = words, y = n, fill = words)
+) + geom_col()
+```
+
+## Who is tweeting about this?
+```{r}
+wordcloud2(tweets %>% count(screen_name))
+```
+Some prolific tweeters but also many smaller ones.
+
+These are the counts with the highest number of tweets.
+```{r}
+ggplot(
+  tweets %>% count(screen_name, sort=TRUE) %>% arrange(desc(n)) %>% head(15),
+  aes(x = screen_name, y = n, fill = screen_name)
+) + geom_col()
+```
+Some accounts are posting many tweets, but nothing weird as they are probably accounts dedicated to crypto stuff.
+Not filtering to get only verified accounts did result on a large number of tweets from (probably) bots.
+
+
+# Sentiment Analysis
+
+Several lexicons for sentiment analysis in tidytext package:
+- bing: binary (positive or negative)
+- afinn: numeric (from -5 to 5, most negative to most positive)
+- loughran: financial terms (pos, neg, litigious, ...)
+- nrc: categorical (whether each word belongs to a certain category - pos, neg, anger, fear, joy...)
+
+For our purpose, bing and afinn will be  used.
+```{r}
+sents.afinn <- get_sentiments("afinn")
+sents.bing <- get_sentiments("bing")
+head(sents.afinn, n = 5)
+```
+We associate each word with its sentiment obtained from the lexicons 
+```{r}
+tweets.afinn <- tweets.unnested %>%
+  inner_join(sents.afinn, by = c("words" = "word"))
+tweets.bing <- tweets.unnested %>% 
+  inner_join(sents.bing, by = c("words" = "word"))
+```
+
+Some words classified using the afinn lexicon
+```{r}
+tweets.afinn %>% select(words, value)
+```
+
+Some words classified using the bing lexicon
+```{r}
+tweets.bing %>% select(words, sentiment)
+```
+
+# AFINN lexicon
+```{r}
+tweets.scores.afinn <- tweets.afinn %>% 
+  group_by(created_hour) %>%
+  summarise(.groups = "keep", score = sum(value))
+```
+
+The results are transformed into a time series and plotted
+```{r}
+tweets.xts <- xts(tweets.scores.afinn$score, order.by = tweets.scores.afinn$created_hour)
+plot(tweets.xts)
+```
+The frequencies of different scores for this lexicon
+```{r}
+hist(tweets.scores.afinn$score)
+```
+
+# Bing lexicon
+```{r}
+tweets.scores.bing <- tweets.bing %>% 
+  group_by(created_at, user_id, created_hour) %>%
+  summarise(.groups = "keep", pos = sum(sentiment == "positive"), neg = sum(sentiment == "negative")) %>%
+  mutate(overall = sum(pos - neg)) %>%
+  mutate(score = sign(overall)) %>%
+  group_by(created_hour) %>%
+  summarise(.groups = "keep", score = sum(score))
+```
+
+The results are transformed into a time series and plotted
+```{r}
+tweets.xts <- xts(tweets.scores.bing$score, order.by = tweets.scores.bing$created_hour)
+plot(tweets.xts)
+```
+The frequencies of different scores for this lexicon
+```{r}
+hist(tweets.scores.bing$score)
+```
+
